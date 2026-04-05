@@ -20,6 +20,16 @@ CODE_EXTENSIONS = {
     ".swift",  # Swift
 }
 
+TEXT_EXTENSIONS = {
+    ".md", ".txt", ".rst",
+    ".json", ".yaml", ".yml", ".toml",
+    ".ini", ".cfg"
+}
+
+ALL_EXTENSIONS = CODE_EXTENSIONS | TEXT_EXTENSIONS
+
+print(ALL_EXTENSIONS)
+
 # Folders that are never worth indexing
 EXCLUDED_DIRS = {
     ".git", "__pycache__", "node_modules", ".venv", "venv",
@@ -65,7 +75,7 @@ def _get_code_files(root_dir: str) -> list[str]:
     of all files whose extension is in CODE_EXTENSIONS,
     skipping any EXCLUDED_DIRS along the way.
     """
-    code_files = []
+    files = []
 
     for dirpath, dirnames, filenames in os.walk(root_dir):
 
@@ -77,8 +87,8 @@ def _get_code_files(root_dir: str) -> list[str]:
 
         for filename in filenames:
             ext = Path(filename).suffix.lower()
-            if ext in CODE_EXTENSIONS:
+            if ext in ALL_EXTENSIONS:
                 full_path = os.path.join(dirpath, filename)
-                code_files.append(full_path)
+                files.append(full_path)
 
-    return sorted(code_files)  # sorted for deterministic ordering
+    return sorted(files)  # sorted for deterministic ordering
