@@ -1,4 +1,5 @@
 from src.ingestion.cloner import clone_repo
+from src.ingestion.document_loader import load_codebase
 
 if __name__ == "__main__":
     import sys
@@ -18,3 +19,10 @@ if __name__ == "__main__":
 
     if len(files) > 20:
         print(f" ... and {len(files) - 20} more")
+
+    documents = load_codebase([file for file in files])
+
+    for doc in documents:
+        print(doc.metadata)
+
+    print(f"DOCUMENTS:\n{documents}")
