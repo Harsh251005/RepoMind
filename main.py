@@ -1,28 +1,20 @@
-from src.ingestion.cloner import clone_repo
-from src.ingestion.document_loader import load_codebase
+import sys
+from src.ingestion.ingestion_pipeline import ingestion_pipeline
 
-if __name__ == "__main__":
-    import sys
 
+def main():
     if len(sys.argv) < 2:
-        print("Error: Please provide a valid GitHub URL")
+        print("[Error] Enter a valid github url")
+        print("Usage: python main.py <github_repo_url>")
         sys.exit(1)
 
     url = sys.argv[1]
-    clone_path, files = clone_repo(url)
 
-    print(f"\nCloned to : {clone_path}")
-    print(f"Code files: {len(files)}\n")
+    result = ingestion_pipeline(url)
 
-    for f in files[:20]:  # Print first 20 so it doesn't flood terminal
-        print(f" → {f}")
+    if result is None:
+        sys.exit(1)
 
-    if len(files) > 20:
-        print(f" ... and {len(files) - 20} more")
 
-    documents = load_codebase([file for file in files])
-
-    for doc in documents:
-        print(doc.metadata)
-
-    print(f"DOCUMENTS:\n{documents}")
+if __name__ == "__main__":
+    main()

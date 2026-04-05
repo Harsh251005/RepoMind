@@ -1,4 +1,6 @@
 import os
+import re
+import hashlib
 import shutil
 from pathlib import Path
 from typing import List, Tuple
@@ -38,7 +40,7 @@ EXCLUDED_DIRS = {
 }
 
 
-def clone_repo(github_url: str, force_refresh: bool = False) -> Tuple[str, List[str]]:
+def clone_repo(github_url: str, force_refresh: bool = False) -> Tuple[str, str, List[str]]:
     """
     Clone repo with caching.
 
@@ -47,6 +49,8 @@ def clone_repo(github_url: str, force_refresh: bool = False) -> Tuple[str, List[
     """
 
     os.makedirs(BASE_CLONE_DIR, exist_ok=True)
+
+    collection_name = generate_collection_name(github_url)
 
     repo_name = github_url.rstrip("/").split("/")[-1].replace(".git", "")
     clone_path = os.path.join(BASE_CLONE_DIR, repo_name)
@@ -57,7 +61,7 @@ def clone_repo(github_url: str, force_refresh: bool = False) -> Tuple[str, List[
             shutil.rmtree(clone_path)
         else:
             print(f"[Cache] Using existing repo at {clone_path}")
-            return clone_path, _get_code_files(clone_path)
+            return collection_name, clone_path, _get_code_files(clone_path)
 
     print(f"[Cloner] Cloning {github_url} into {clone_path}")
 
@@ -66,7 +70,7 @@ def clone_repo(github_url: str, force_refresh: bool = False) -> Tuple[str, List[
     except GitCommandError as e:
         raise RuntimeError(f"Clone failed: {e}")
 
-    return clone_path, _get_code_files(clone_path)
+    return collection_name, clone_path, _get_code_files(clone_path)
 
 
 def _get_code_files(root_dir: str) -> list[str]:
@@ -92,3 +96,44 @@ def _get_code_files(root_dir: str) -> list[str]:
                 files.append(full_path)
 
     return sorted(files)  # sorted for deterministic ordering
+
+
+
+
+def generate_collection_name(repo_url: str, max_length: int = 50) -> str:
+    """
+    Generate a safe, unique Qdrant collection name from repo URL.
+
+    Format:
+        <normalized_repo_name>_<short_hash>
+
+    Example:
+        blog_generation_app_a1b2c3d4
+    """
+
+    # Step 1: Extract repo name
+    repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
+
+    # Step 2: Normalize
+    repo_name = repo_name.lower()
+
+    # Replace non-alphanumeric characters with underscore
+    repo_name = re.sub(r"[^a-z0-9]+", "_", repo_name)
+
+    # Remove leading/trailing underscores
+    repo_name = repo_name.strip("_")
+
+    # Step 3: Generate short hash from full URL
+    repo_hash = hashlib.md5(repo_url.encode()).hexdigest()[:8]
+
+    # Step 4: Combine
+    collection_name = f"{repo_name}_{repo_hash}"
+
+    # Step 5: Enforce max length (important for safety)
+    if len(collection_name) > max_length:
+        # Trim repo name but keep hash
+        trim_length = max_length - len(repo_hash) - 1
+        repo_name = repo_name[:trim_length]
+        collection_name = f"{repo_name}_{repo_hash}"
+
+    return collection_name
