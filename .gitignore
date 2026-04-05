@@ -26,6 +26,7 @@ ENV/
 *.log
 *.tmp
 *.temp
+repo_cache
 
 # =========================
 # IDE / Editor files
