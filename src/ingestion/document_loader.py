@@ -16,7 +16,7 @@ def load_codebase(file_paths: List[str]) -> List[Document]:
 
     Each document contains:
     - content: file content
-    - metadata: file path, extension, filename
+    - metadata: file path, extension, filename, type
     """
 
     documents = []

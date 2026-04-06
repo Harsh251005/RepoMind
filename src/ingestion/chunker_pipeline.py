@@ -1,73 +1,81 @@
-from typing import List
-from src.ingestion.code_chunker import chunk_code
-from src.ingestion.text_chunker import chunk_text_rcts
+from typing import List, Union
+from src.ingestion.code_chunker import chunk_code, CodeChunk
+from src.ingestion.text_chunker import chunk_text, TextChunk
 from src.ingestion.document_loader import Document
 
 
 def chunk_documents(documents: List[Document]) -> List[Document]:
     """
-    Routes documents to appropriate chunkers (code/text)
-    and returns chunked Document objects.
+    Routes documents to appropriate chunkers and returns chunked Documents.
+
+    - Code files  → chunk_code()  → CodeChunk (carries start_line, end_line, language)
+    - Text files  → chunk_text()  → TextChunk (carries file_type, json_key etc.)
+
+    All chunk metadata is merged into the Document metadata so nothing is lost.
     """
 
     chunked_docs = []
 
     for doc in documents:
         doc_type = doc.metadata.get("type")
-        ext = doc.metadata.get("extension")
+        ext      = doc.metadata.get("extension", "")
+        path     = doc.metadata.get("path", "")
 
-        if not doc.content:
+        if not doc.content or not doc.content.strip():
             continue
 
-        # Route based on type
         if doc_type == "code":
-            doc_chunks = chunk_code(doc.content, ext)
+            chunks: List[Union[CodeChunk, TextChunk]] = chunk_code(
+                doc.content, ext, file_path=path
+            )
         else:
-            doc_chunks = chunk_text_rcts(doc.content)
+            chunks = chunk_text(
+                doc.content, ext, file_path=path
+            )
 
-        if not doc_chunks:
+        if not chunks:
             continue
 
-        for i, chunk in enumerate(doc_chunks):
-            chunked_docs.append(
-                Document(
-                    content=chunk,
-                    metadata={
-                        **doc.metadata,
-                        "chunk_id": i,
-                    }
-                )
-            )
+        for chunk in chunks:
+            # Pull all fields off the chunk dataclass into metadata
+            chunk_metadata = _extract_chunk_metadata(chunk)
+
+            chunked_docs.append(Document(
+                content  = chunk.content,
+                metadata = {
+                    **doc.metadata,       # original doc metadata (filename, path, type…)
+                    **chunk_metadata,     # chunk-specific metadata (lines, language…)
+                },
+            ))
 
     return chunked_docs
 
 
-from typing import List
-from src.ingestion.document_loader import Document
-
-
-def documents_to_texts(documents: List[Document]) -> List[str]:
+def _extract_chunk_metadata(chunk: Union[CodeChunk, TextChunk]) -> dict:
     """
-    Convert Document objects into enriched text for better embeddings.
+    Extracts serialisable metadata from a CodeChunk or TextChunk.
+    Keeps only fields that are useful downstream in the vector store.
     """
 
-    texts = []
+    base = {
+        "chunk_index": chunk.chunk_index,
+        "chunk_type":  type(chunk).__name__,   # "CodeChunk" or "TextChunk"
+    }
 
-    for doc in documents:
-        if not doc.content or not doc.content.strip():
-            continue
+    if isinstance(chunk, CodeChunk):
+        base.update({
+            "language":   chunk.language,
+            "start_line": chunk.start_line,
+            "end_line":   chunk.end_line,
+        })
 
-        metadata = doc.metadata
+    if isinstance(chunk, TextChunk):
+        base.update({
+            "file_type": chunk.file_type,   # "markdown" | "structured" | "text"
+        })
 
-        enriched_text = f"""
-        File: {metadata.get("filename")}
-        Path: {metadata.get("path")}
-        Type: {metadata.get("type")}
-        
-        Content:
-        {doc.content}
-"""
+    # Merge any extra metadata the chunk carries (e.g. json_key, sub_chunk_index)
+    if chunk.metadata:
+        base.update(chunk.metadata)
 
-        texts.append(enriched_text.strip())
-
-    return texts
+    return base

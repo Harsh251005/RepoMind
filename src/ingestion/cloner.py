@@ -30,8 +30,6 @@ TEXT_EXTENSIONS = {
 
 ALL_EXTENSIONS = CODE_EXTENSIONS | TEXT_EXTENSIONS
 
-print(ALL_EXTENSIONS)
-
 # Folders that are never worth indexing
 EXCLUDED_DIRS = {
     ".git", "__pycache__", "node_modules", ".venv", "venv",

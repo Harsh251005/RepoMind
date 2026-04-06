@@ -1,214 +1,418 @@
 import re
+import ast
+import logging
+from dataclasses import dataclass, field
 from typing import List
 
+logger = logging.getLogger(__name__)
 
-def chunk_code(content: str, ext: str) -> List[str]:
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+MAX_CHUNK_SIZE = 1500       # characters — raised to fit real-world functions
+CHUNK_OVERLAP  = 200        # characters
+MIN_CHUNK_SIZE = 30         # characters — anything below this is noise
+
+
+# ─── Data Model ───────────────────────────────────────────────────────────────
+
+@dataclass
+class CodeChunk:
+    content:     str
+    file_path:   str          = ""
+    language:    str          = "text"
+    start_line:  int          = 0
+    end_line:    int          = 0
+    chunk_index: int          = 0
+    metadata:    dict         = field(default_factory=dict)
+
+    def is_valid(self) -> bool:
+        return bool(self.content.strip()) and len(self.content.strip()) >= MIN_CHUNK_SIZE
+
+
+# ─── Public Entry Point ───────────────────────────────────────────────────────
+
+def chunk_code(content: str, ext: str, file_path: str = "") -> List[CodeChunk]:
     """
     Main entry point for code chunking.
 
-    Steps:
-    1. Try language-aware chunking
-    2. Fallback to structure-based splitting
-    3. Enforce chunk size constraints
+    Pipeline:
+    1. AST-based splitting  (Python only, most accurate)
+    2. Tree-sitter splitting (multi-language, accurate)
+    3. Structure-based splitting (heuristic fallback)
+    4. Enforce size constraints on all chunks
+    5. Filter noise chunks
 
     Args:
-        content (str): Full file content
-        ext (str): File extension (e.g., ".py", ".js")
+        content   : Full file content as string
+        ext       : File extension e.g. ".py", ".js"
+        file_path : Source file path — stored in chunk metadata
 
     Returns:
-        List[str]: List of code chunks
+        List[CodeChunk]
     """
 
     if not content or not content.strip():
         return []
-
-    # Step 1: Try language-aware splitting
-    try:
-        chunks = _chunk_by_language(content, ext)
-    except Exception:
-        chunks = []
-
-    # Step 2: Fallback if language-based failed or returned nothing
-    if not chunks:
-        chunks = _split_by_structure(content)
-
-    # Step 3: Enforce size constraints
-    chunks = _enforce_chunk_size(chunks)
-
-    return chunks
-
-
-from typing import List
-
-
-def _chunk_by_language(content: str, ext: str) -> List[str]:
-    """
-    Attempts language-aware code chunking using a code-aware splitter.
-
-    Falls back silently if:
-    - language is unsupported
-    - splitter fails
-    """
 
     language = _map_extension_to_language(ext)
+    chunks: List[CodeChunk] = []
 
-    # If unknown language → skip
-    if language == "text":
+    # Step 1 — Python AST (most reliable for .py files)
+    if language == "python":
+        chunks = _chunk_python_ast(content, file_path)
+        if chunks:
+            logger.debug(f"AST chunking produced {len(chunks)} chunks for {file_path}")
+
+    # Step 2 — Tree-sitter (for all other supported languages)
+    if not chunks and language != "text":
+        chunks = _chunk_tree_sitter(content, language, file_path)
+        if chunks:
+            logger.debug(f"Tree-sitter chunking produced {len(chunks)} chunks for {file_path}")
+
+    # Step 3 — Structural heuristic fallback
+    if not chunks:
+        logger.warning(f"Falling back to structural chunking for {file_path} (lang={language})")
+        chunks = _chunk_by_structure(content, language, file_path)
+
+    # Step 4 — Enforce size limits
+    chunks = _enforce_chunk_size(chunks)
+
+    # Step 5 — Filter noise
+    chunks = [c for c in chunks if c.is_valid()]
+
+    # Re-index after filtering
+    for i, chunk in enumerate(chunks):
+        chunk.chunk_index = i
+
+    return chunks
+
+
+# ─── Strategy 1: Python AST ───────────────────────────────────────────────────
+
+def _chunk_python_ast(content: str, file_path: str) -> List[CodeChunk]:
+    """
+    Uses Python's built-in AST to extract top-level and nested definitions.
+
+    Captures:
+    - Module-level functions (including decorators)
+    - Classes (as a single chunk with all their methods)
+    - Falls back the remaining module-level code as one chunk
+    """
+
+    try:
+        tree = ast.parse(content)
+    except SyntaxError as e:
+        logger.warning(f"AST parse failed for {file_path}: {e}")
+        return []
+
+    lines = content.splitlines(keepends=True)
+    chunks: List[CodeChunk] = []
+    covered_lines = set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+
+        # Only top-level nodes (parent is Module)
+        # We check this by confirming no parent function/class wraps it
+        # ast.walk doesn't give parents, so we limit to top-level by line depth
+        if not _is_top_level(node, tree):
+            continue
+
+        # Include decorator lines — this is the key fix for orphaned decorators
+        start = _get_decorator_start(node) - 1   # 0-indexed
+        end   = node.end_lineno                   # 1-indexed inclusive
+
+        chunk_lines = lines[start:end]
+        chunk_content = "".join(chunk_lines).strip()
+
+        if not chunk_content:
+            continue
+
+        chunks.append(CodeChunk(
+            content    = chunk_content,
+            file_path  = file_path,
+            language   = "python",
+            start_line = start + 1,
+            end_line   = end,
+        ))
+
+        covered_lines.update(range(start, end))
+
+    # Collect module-level code not part of any top-level definition
+    remaining_lines = [
+        line for i, line in enumerate(lines)
+        if i not in covered_lines
+    ]
+    remaining = "".join(remaining_lines).strip()
+
+    if remaining and len(remaining) >= MIN_CHUNK_SIZE:
+        chunks.append(CodeChunk(
+            content    = remaining,
+            file_path  = file_path,
+            language   = "python",
+            start_line = 1,
+            end_line   = len(lines),
+            metadata   = {"type": "module_level"},
+        ))
+
+    return chunks
+
+
+def _is_top_level(node: ast.AST, tree: ast.Module) -> bool:
+    """Returns True if node is a direct child of the module."""
+    return node in ast.walk(tree) and node in tree.body
+
+
+def _get_decorator_start(node) -> int:
+    """Returns the line number of the first decorator, or the node itself."""
+    if node.decorator_list:
+        return node.decorator_list[0].lineno
+    return node.lineno
+
+
+# ─── Strategy 2: Tree-sitter ──────────────────────────────────────────────────
+
+def _chunk_tree_sitter(content: str, language: str, file_path: str) -> List[CodeChunk]:
+    """
+    Uses tree-sitter to parse and extract function/class/method nodes.
+
+    Requires: pip install tree-sitter tree-sitter-languages
+
+    Node types targeted per language:
+    - function_definition, class_definition (Python-like)
+    - function_declaration, method_definition (JS/TS)
+    - method_declaration (Java, C#)
+    """
+
+    try:
+        from tree_sitter_languages import get_language, get_parser
+
+        ts_language = get_language(language)
+        parser      = get_parser(language)
+
+    except ImportError:
+        logger.warning("tree-sitter-languages not installed. Skipping tree-sitter chunking.")
+        return []
+    except Exception as e:
+        logger.warning(f"Tree-sitter setup failed for language '{language}': {e}")
         return []
 
     try:
-        from code_splitter import CodeSplitter
+        tree  = parser.parse(bytes(content, "utf-8"))
+        lines = content.splitlines(keepends=True)
 
-        splitter = CodeSplitter(language=language)
+        target_node_types = {
+            "function_definition", "async_function_definition",
+            "function_declaration", "async_function_declaration",
+            "class_definition", "class_declaration",
+            "method_definition", "method_declaration",
+            "arrow_function",
+        }
 
-        chunks = splitter.split_text(content)
+        chunks: List[CodeChunk] = []
+        seen_ranges: List[tuple] = []
 
-        # Basic validation
-        if not chunks or not isinstance(chunks, list):
-            return []
+        def traverse(node):
+            if node.type in target_node_types:
+                start_line = node.start_point[0]     # 0-indexed
+                end_line   = node.end_point[0] + 1   # 0-indexed end, make exclusive
 
-        return [chunk.strip() for chunk in chunks if chunk.strip()]
+                # Skip if already covered by a parent node
+                if any(s <= start_line and end_line <= e for s, e in seen_ranges):
+                    return
 
-    except Exception:
-        # Fail silently → fallback will handle
+                chunk_content = "".join(lines[start_line:end_line]).strip()
+
+                if chunk_content and len(chunk_content) >= MIN_CHUNK_SIZE:
+                    chunks.append(CodeChunk(
+                        content    = chunk_content,
+                        file_path  = file_path,
+                        language   = language,
+                        start_line = start_line + 1,
+                        end_line   = end_line,
+                    ))
+                    seen_ranges.append((start_line, end_line))
+
+            for child in node.children:
+                traverse(child)
+
+        traverse(tree.root_node)
+        return chunks
+
+    except Exception as e:
+        logger.warning(f"Tree-sitter parsing failed for {file_path}: {e}")
         return []
 
 
+# ─── Strategy 3: Structural Heuristic Fallback ───────────────────────────────
 
-
-def _split_by_structure(content: str) -> List[str]:
+def _chunk_by_structure(content: str, language: str, file_path: str) -> List[CodeChunk]:
     """
-    Fallback code chunking using simple structural heuristics.
+    Language-agnostic fallback using blank lines + indentation heuristics.
 
-    Splits code based on:
-    - function definitions
-    - class definitions
-    - common keywords across languages
+    Logic:
+    - Splits on double newlines (paragraph-style natural boundaries)
+    - Further splits on common definition keywords only at line-start
+      (not mid-code occurrences like 'public' as a field modifier)
 
-    This is language-agnostic and ensures reasonable chunks
-    even when language-aware splitting fails.
+    Overlap is applied here too for consistency with the sliding window.
     """
 
     if not content or not content.strip():
         return []
 
-    # Heuristic pattern for common code boundaries
-    pattern = r"\n(?=def |class |function |export |public |private |protected )"
+    lines = content.splitlines(keepends=True)
+    chunks: List[CodeChunk] = []
+    current_block: List[str] = []
+    current_start = 1
 
-    parts = re.split(pattern, content)
+    # Keywords that signal a new top-level block — only when at column 0
+    top_level_keywords = re.compile(
+        r"^(def |async def |class |function |export (default |async )?function |"
+        r"public (static |final |abstract )?(class |void |int |String )|"
+        r"private |protected |func |fn |impl |struct |enum )"
+    )
 
-    chunks = []
+    def flush_block(end_line: int):
+        nonlocal current_start
+        block = "".join(current_block).strip()
+        if block and len(block) >= MIN_CHUNK_SIZE:
+            chunks.append(CodeChunk(
+                content    = block,
+                file_path  = file_path,
+                language   = language,
+                start_line = current_start,
+                end_line   = end_line,
+            ))
+        current_block.clear()
+        current_start = end_line + 1
 
-    for part in parts:
-        part = part.strip()
+    for i, line in enumerate(lines, start=1):
+        is_new_block = (
+            top_level_keywords.match(line)
+            and current_block                # don't split on very first block
+            and "".join(current_block).strip()
+        )
 
-        if not part:
-            continue
+        if is_new_block:
+            flush_block(i - 1)
 
-        chunks.append(part)
+        current_block.append(line)
+
+    # Flush remaining
+    if current_block:
+        flush_block(len(lines))
 
     return chunks
 
 
-from typing import List
+# ─── Size Enforcement ─────────────────────────────────────────────────────────
 
-
-MAX_CHUNK_SIZE = 1000   # characters
-CHUNK_OVERLAP = 150     # characters
-
-
-def _enforce_chunk_size(chunks: List[str]) -> List[str]:
+def _enforce_chunk_size(chunks: List[CodeChunk]) -> List[CodeChunk]:
     """
-    Ensures all chunks are within size limits.
+    Splits chunks that exceed MAX_CHUNK_SIZE using a line-aware sliding window.
 
-    - Keeps small chunks as-is
-    - Splits large chunks using sliding window
+    Line-awareness ensures we never cut mid-line — unlike the old char-slicing.
     """
 
-    final_chunks = []
+    final_chunks: List[CodeChunk] = []
 
     for chunk in chunks:
-        chunk = chunk.strip()
-
-        if not chunk:
-            continue
-
-        # If chunk is within limit → keep as is
-        if len(chunk) <= MAX_CHUNK_SIZE:
+        if len(chunk.content) <= MAX_CHUNK_SIZE:
             final_chunks.append(chunk)
         else:
-            # Too large → split further
-            split_chunks = _sliding_window(chunk)
-            final_chunks.extend(split_chunks)
+            sub_chunks = _line_aware_sliding_window(chunk)
+            final_chunks.extend(sub_chunks)
 
     return final_chunks
 
 
-def _sliding_window(text: str) -> List[str]:
+def _line_aware_sliding_window(chunk: CodeChunk) -> List[CodeChunk]:
     """
-    Splits text into overlapping chunks.
+    Splits a large chunk into overlapping sub-chunks on line boundaries.
 
-    Uses:
-    - MAX_CHUNK_SIZE for chunk length
-    - CHUNK_OVERLAP to preserve context between chunks
+    Unlike raw character slicing, this always breaks at newlines so
+    no line of code is ever cut in the middle.
     """
 
-    chunks = []
+    lines       = chunk.content.splitlines(keepends=True)
+    sub_chunks: List[CodeChunk] = []
+    start_idx   = 0
+    sub_index   = 0
 
-    text_length = len(text)
-    start = 0
+    while start_idx < len(lines):
+        accumulated = []
+        char_count  = 0
+        end_idx     = start_idx
 
-    while start < text_length:
-        end = start + MAX_CHUNK_SIZE
+        # Consume lines until we hit the size limit
+        while end_idx < len(lines):
+            line = lines[end_idx]
+            if char_count + len(line) > MAX_CHUNK_SIZE and accumulated:
+                break
+            accumulated.append(line)
+            char_count += len(line)
+            end_idx    += 1
 
-        chunk = text[start:end]
-        chunks.append(chunk)
+        content = "".join(accumulated).strip()
 
-        # Move forward with overlap
-        start += MAX_CHUNK_SIZE - CHUNK_OVERLAP
+        if content and len(content) >= MIN_CHUNK_SIZE:
+            sub_chunks.append(CodeChunk(
+                content    = content,
+                file_path  = chunk.file_path,
+                language   = chunk.language,
+                start_line = chunk.start_line + start_idx,
+                end_line   = chunk.start_line + end_idx - 1,
+                metadata   = {**chunk.metadata, "sub_chunk_index": sub_index},
+            ))
+            sub_index += 1
 
-    return chunks
+        # Move forward, backing up CHUNK_OVERLAP worth of characters for overlap
+        overlap_chars = 0
+        overlap_lines = 0
+        for line in reversed(accumulated):
+            if overlap_chars >= CHUNK_OVERLAP:
+                break
+            overlap_chars += len(line)
+            overlap_lines += 1
 
+        next_start = end_idx - overlap_lines
+        if next_start <= start_idx:
+            next_start = start_idx + 1   # safety: always advance
+
+        start_idx = next_start
+
+    return sub_chunks
+
+
+# ─── Language Mapping ─────────────────────────────────────────────────────────
 
 def _map_extension_to_language(ext: str) -> str:
     """
-    Maps file extensions to language names understood by the code splitter.
-
-    Returns:
-        str: language name (e.g., "python", "javascript")
-             or "text" if unsupported
+    Maps file extensions to language identifiers.
+    Both AST and tree-sitter strategies use these names.
     """
 
-    ext = ext.lower()
-
     mapping = {
-        # Python
-        ".py": "python",
-
-        # JavaScript / TypeScript
-        ".js": "javascript",
-        ".jsx": "javascript",
-        ".ts": "typescript",
-        ".tsx": "typescript",
-
-        # JVM languages
+        ".py":   "python",
+        ".js":   "javascript",
+        ".jsx":  "javascript",
+        ".ts":   "typescript",
+        ".tsx":  "typescript",
         ".java": "java",
-        ".kt": "kotlin",
-
-        # Systems languages
-        ".c": "c",
-        ".cpp": "cpp",
-        ".cc": "cpp",
-        ".h": "cpp",
-        ".hpp": "cpp",
-
-        # Others
-        ".go": "go",
-        ".rs": "rust",
-        ".cs": "csharp",
-        ".rb": "ruby",
-        ".php": "php",
-        ".swift": "swift",
+        ".kt":   "kotlin",
+        ".c":    "c",
+        ".cpp":  "cpp",
+        ".cc":   "cpp",
+        ".h":    "cpp",
+        ".hpp":  "cpp",
+        ".go":   "go",
+        ".rs":   "rust",
+        ".cs":   "c_sharp",
+        ".rb":   "ruby",
+        ".php":  "php",
+        ".swift":"swift",
     }
 
-    return mapping.get(ext, "text")
+    return mapping.get(ext.lower(), "text")

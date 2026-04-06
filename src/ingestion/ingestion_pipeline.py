@@ -1,8 +1,9 @@
 import time
 from src.ingestion.cloner import clone_repo
 from src.ingestion.document_loader import load_codebase
-from src.ingestion.chunker_pipeline import chunk_documents, documents_to_texts
+from src.ingestion.chunker_pipeline import chunk_documents
 from src.ingestion.chunks_embedder import embed_texts
+from src.ingestion.text_enricher import documents_to_texts
 from src.ingestion.vector_store import store_in_qdrant
 
 
